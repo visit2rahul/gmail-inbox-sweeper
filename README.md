@@ -1,4 +1,4 @@
-# Gmail Cleanup
+# Gmail Sweeper
 
 A Google Apps Script that automatically cleans up your Gmail inbox. It discovers who's flooding your inbox, lets you block them by domain, bulk-trashes junk, purges old promotions, and runs daily on autopilot.
 
