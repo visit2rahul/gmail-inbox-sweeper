@@ -242,79 +242,23 @@ function removeTriggers() {
 }
 
 // ============================================================
-// STEP 5: ADD BLOCK LIST — review and run once
+// STEP 5: ADD YOUR BLOCK LIST
 // ============================================================
 
 /**
- * Adds curated block list from discoverSpam() results.
- * Review the lists below. Remove any domain you want to keep.
- * Run once — domains are saved to Script Properties.
+ * Example: after running discoverSpam(), add your unwanted domains here.
+ * Customize this list for your inbox, then run once.
+ *
+ * Usage:
+ *   1. Run discoverSpam() and review the logs
+ *   2. Copy unwanted domains into the array below
+ *   3. Run addBlocks()
+ *   4. Run bulkCleanup() to trash existing emails
  */
 function addBlocks() {
-
-  // --- OBVIOUS SPAM (gibberish domains, scam senders) ---
-  var spam = [
-    '628741843.628741843.com',
-    'a83kczzeye2.sichuanpools.com',
-    'cvjki.sb010.screenglow.biz.ua',
-    '5646754067361.frqdsdnforssgficyl.org.uk',
-    'rdly3.sb019.pointlegal.biz.ua',
-    'syysl.222.sb004.peakrights.biz.ua',
-    'erockl.sbs',
-    'z9vk.glvdg1trhw.us',
-    '2662813113110.wuqnrawkhrmgbrlnqn.org.uk',
-    '7119407179655.ylhofknpefzuwwuf.org.uk',
-    'zaqi.70dnyib4nu.us',
-    '0880927368415.yxkieskulimvexdl.org.uk',
-    'c9f6.z9ty3jcht3.us',
-    '9gia.ibxml6b8az.us',
-    '8355246391347.qymnsvcdnuqlfiibfp.org.uk',
-    'zy20i.sb0024.dajil.biz.ua',
-    'hmvf9.sb005.vewet.biz.ua',
-    'aslopat.live',
-    'arlowk.my',
-    'dirtab.my',
-    'biztan.my',
-    'global-be42a.firebaseapp.com',
-    'click.markets',
-    'mailgro.com',
-    'rtyhkul.createsend7.com',
-    'qq.com',
-    'yeah.net',
-    '163.com'
-  ];
-
-  // --- RETAIL / PROMO NOISE ---
-  var retail = [
-    'b.express.com',
-    'bc.footlocker.com',
-    'emails.skechers.com',
-    'e.tommy.com',
-    'innovations.samsungusa.com',
-    'info.asics.com',
-    'bc.flxprogram.com',
-    'mail.renpho.com',
-    'kodakmoments.com',
-    'vivtone.com'
-  ];
-
-  // --- MARKETING / NEWSLETTERS ---
-  var marketing = [
-    'rs.email.nextdoor.com',
-    'mail.trade-ideas.com',
-    'ashburnmagazine.com',
-    'techslash.com',
-    'camp.roadrunnersports.com',
-    'shared1.ccsend.com',
-    'marketing.tropicalsmoothie.com',
-    'promotions.papajohns.com',
-    'e-rewards.dominos.com',
-    'em.haircuttery.com',
-    'contact.elementsmassage.com'
-  ];
-
-  var all = spam.concat(retail).concat(marketing);
-  updateBlockedDomains(all);
-  Logger.log('\nTotal domains added: ' + all.length);
-  Logger.log('Run bulkCleanup() to trash existing emails from these domains.');
+  updateBlockedDomains([
+    // Add your domains here, e.g.:
+    // 'spam-sender.com',
+    // 'unwanted-newsletter.com',
+  ]);
 }
