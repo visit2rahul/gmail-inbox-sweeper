@@ -1,14 +1,15 @@
 /**
  * Tests for Gmail Inbox Sweeper (src/cleanup.gs)
  *
- * These tests verify all functions, safety guarantees, and edge cases
- * using mocked Google Apps Script globals (GmailApp, PropertiesService, etc.)
+ * These tests verify all functions, safety guarantees, edge cases,
+ * and the continuation trigger pattern using mocked Google Apps Script globals.
  *
  * Safety guarantees under test:
  *   - Primary inbox is never touched (query always includes -category:primary)
  *   - Trash only (moveToTrash, never delete)
  *   - Discovery is read-only (no moveToTrash calls during discoverSpam)
  *   - Block list is user-controlled (empty list = no action)
+ *   - Continuation triggers auto-resume long-running operations
  */
 
 const {
@@ -45,12 +46,52 @@ beforeEach(() => {
   resetAllMocks();
 });
 
+// Helper: mock Date to simulate time progression past the limit
+function mockTimeLimitExceeded() {
+  var callCount = 0;
+  var startTime = 1000000;
+  var originalDate = global.Date;
+  global.Date = class extends originalDate {
+    getTime() {
+      callCount++;
+      // After first call, jump past 5 min
+      if (callCount > 2) return startTime + 6 * 60 * 1000;
+      return startTime;
+    }
+    toISOString() {
+      return new originalDate().toISOString();
+    }
+  };
+  return function restore() {
+    global.Date = originalDate;
+  };
+}
+
+// Helper: set up PropertiesService to track state across get/set calls
+function useStatefulProperties(initial) {
+  var store = Object.assign({}, initial || {});
+  mockScriptProperties.getProperty.mockImplementation(function(key) {
+    return store.hasOwnProperty(key) ? store[key] : null;
+  });
+  mockScriptProperties.setProperty.mockImplementation(function(key, val) {
+    store[key] = val;
+  });
+  mockScriptProperties.deleteProperty.mockImplementation(function(key) {
+    delete store[key];
+  });
+  mockScriptProperties.getProperties.mockImplementation(function() {
+    return Object.assign({}, store);
+  });
+  return store;
+}
+
 // ============================================================
 // A. Configuration functions
 // ============================================================
 
 describe('configureDefaults', () => {
   test('sets all three defaults when no properties exist', () => {
+    useStatefulProperties();
     configureDefaults();
 
     expect(mockScriptProperties.setProperty).toHaveBeenCalledWith('BLOCK_DOMAINS', '[]');
@@ -59,15 +100,9 @@ describe('configureDefaults', () => {
   });
 
   test('does not overwrite existing properties (idempotent)', () => {
-    // Pre-set a value
-    mockScriptProperties.getProperty.mockImplementation((key) => {
-      if (key === 'PROMO_MAX_AGE_DAYS') return '14';
-      return null;
-    });
-
+    useStatefulProperties({ PROMO_MAX_AGE_DAYS: '14' });
     configureDefaults();
 
-    // Should not have been called with PROMO_MAX_AGE_DAYS since it already exists
     var promoSetCalls = mockScriptProperties.setProperty.mock.calls.filter(
       (call) => call[0] === 'PROMO_MAX_AGE_DAYS'
     );
@@ -75,6 +110,7 @@ describe('configureDefaults', () => {
   });
 
   test('logs confirmation of settings', () => {
+    useStatefulProperties();
     configureDefaults();
     expect(mockLogger.log).toHaveBeenCalledWith('Defaults configured. Current settings:');
   });
@@ -119,8 +155,7 @@ describe('getConfigInt_ (internal)', () => {
 
 describe('updateBlockedDomains', () => {
   test('adds new domains to an empty list', () => {
-    mockScriptProperties.getProperty.mockReturnValue('[]');
-
+    useStatefulProperties({ BLOCK_DOMAINS: '[]' });
     updateBlockedDomains(['spam.com', 'junk.co']);
 
     var setCall = mockScriptProperties.setProperty.mock.calls.find(
@@ -132,8 +167,7 @@ describe('updateBlockedDomains', () => {
   });
 
   test('merges without duplicates', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["a.com"]');
-
+    useStatefulProperties({ BLOCK_DOMAINS: '["a.com"]' });
     updateBlockedDomains(['a.com', 'b.com']);
 
     var setCall = mockScriptProperties.setProperty.mock.calls.find(
@@ -144,11 +178,9 @@ describe('updateBlockedDomains', () => {
   });
 
   test('with no arguments, logs current list without modifying', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["a.com","b.com"]');
-
+    useStatefulProperties({ BLOCK_DOMAINS: '["a.com","b.com"]' });
     updateBlockedDomains();
 
-    // setProperty should NOT have been called for BLOCK_DOMAINS
     var setCall = mockScriptProperties.setProperty.mock.calls.find(
       (call) => call[0] === 'BLOCK_DOMAINS'
     );
@@ -157,8 +189,7 @@ describe('updateBlockedDomains', () => {
   });
 
   test('with empty array, logs current list without modifying', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["a.com"]');
-
+    useStatefulProperties({ BLOCK_DOMAINS: '["a.com"]' });
     updateBlockedDomains([]);
 
     var setCall = mockScriptProperties.setProperty.mock.calls.find(
@@ -170,8 +201,7 @@ describe('updateBlockedDomains', () => {
 
 describe('unblockDomain', () => {
   test('removes a domain that exists in the list', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["spam.com","junk.co"]');
-
+    useStatefulProperties({ BLOCK_DOMAINS: '["spam.com","junk.co"]' });
     unblockDomain('spam.com');
 
     var setCall = mockScriptProperties.setProperty.mock.calls.find(
@@ -182,14 +212,12 @@ describe('unblockDomain', () => {
   });
 
   test('does not error when domain is not in the list', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["spam.com"]');
-
+    useStatefulProperties({ BLOCK_DOMAINS: '["spam.com"]' });
     expect(() => unblockDomain('nothere.com')).not.toThrow();
   });
 
   test('results in empty list when removing the only domain', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["spam.com"]');
-
+    useStatefulProperties({ BLOCK_DOMAINS: '["spam.com"]' });
     unblockDomain('spam.com');
 
     var setCall = mockScriptProperties.setProperty.mock.calls.find(
@@ -217,7 +245,7 @@ describe('discoverSpam', () => {
 
     var result = discoverSpam();
 
-    expect(result['spam.com']).toBe(5); // 3 + 2
+    expect(result['spam.com']).toBe(5);
     expect(result['legit.org']).toBe(1);
   });
 
@@ -294,8 +322,7 @@ describe('discoverSpam', () => {
 
 describe('bulkCleanup', () => {
   test('with empty block list, logs message and does not search', () => {
-    mockScriptProperties.getProperty.mockReturnValue('[]');
-
+    useStatefulProperties({ BLOCK_DOMAINS: '[]' });
     bulkCleanup();
 
     expect(mockGmailApp.search).not.toHaveBeenCalled();
@@ -305,7 +332,7 @@ describe('bulkCleanup', () => {
   });
 
   test('trashes emails from blocked domains', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["spam.com"]');
+    useStatefulProperties({ BLOCK_DOMAINS: '["spam.com"]' });
 
     var thread1 = createMockThread('user@spam.com', 1);
     var thread2 = createMockThread('other@spam.com', 1);
@@ -318,7 +345,7 @@ describe('bulkCleanup', () => {
   });
 
   test('SAFETY: search query always includes -category:primary', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["spam.com"]');
+    useStatefulProperties({ BLOCK_DOMAINS: '["spam.com"]' });
     setSearchResults('from:@spam.com', [[]]);
 
     bulkCleanup();
@@ -328,10 +355,9 @@ describe('bulkCleanup', () => {
   });
 
   test('SAFETY: uses moveToTrash, not any delete method', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["spam.com"]');
+    useStatefulProperties({ BLOCK_DOMAINS: '["spam.com"]' });
 
     var thread = createMockThread('user@spam.com', 1);
-    // Ensure no delete-like methods exist on the thread mock
     thread.moveToSpam = jest.fn();
     thread.delete = jest.fn();
     setSearchResults('from:@spam.com', [[thread], []]);
@@ -344,9 +370,8 @@ describe('bulkCleanup', () => {
   });
 
   test('paginates through multiple batches', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["spam.com"]');
+    useStatefulProperties({ BLOCK_DOMAINS: '["spam.com"]' });
 
-    // First batch of 3, second batch of 2, then empty
     var batch1 = [
       createMockThread('a@spam.com', 1),
       createMockThread('b@spam.com', 1),
@@ -360,13 +385,12 @@ describe('bulkCleanup', () => {
 
     bulkCleanup();
 
-    // All 5 threads should be trashed
     batch1.forEach((t) => expect(t.moveToTrash).toHaveBeenCalled());
     batch2.forEach((t) => expect(t.moveToTrash).toHaveBeenCalled());
   });
 
   test('processes multiple blocked domains', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["spam.com","junk.co"]');
+    useStatefulProperties({ BLOCK_DOMAINS: '["spam.com","junk.co"]' });
 
     var spamThread = createMockThread('a@spam.com', 1);
     var junkThread = createMockThread('b@junk.co', 1);
@@ -379,37 +403,79 @@ describe('bulkCleanup', () => {
     expect(junkThread.moveToTrash).toHaveBeenCalled();
   });
 
-  test('handles time limit by stopping and logging', () => {
-    mockScriptProperties.getProperty.mockReturnValue('["spam.com"]');
+  test('schedules continuation trigger on time limit', () => {
+    useStatefulProperties({ BLOCK_DOMAINS: '["spam.com"]' });
+    var restore = mockTimeLimitExceeded();
 
-    // Simulate time progression: first call returns now, subsequent calls return 6 minutes later
-    var callCount = 0;
-    var startTime = 1000000;
-    var originalDate = global.Date;
-    global.Date = class extends originalDate {
-      getTime() {
-        callCount++;
-        // After first call (inside the while loop check), jump past 5 min
-        if (callCount > 2) return startTime + 6 * 60 * 1000;
-        return startTime;
-      }
-      toISOString() {
-        return new originalDate().toISOString();
-      }
-    };
-
-    // Return threads forever to test that the time limit stops processing
     var threads = [createMockThread('a@spam.com', 1)];
-    setSearchResults('from:@spam.com', [threads, threads, threads, threads, threads]);
+    setSearchResults('from:@spam.com', [threads, threads, threads]);
 
     bulkCleanup();
 
+    expect(mockScriptApp.newTrigger).toHaveBeenCalledWith('bulkCleanup');
     expect(mockLogger.log).toHaveBeenCalledWith(
-      expect.stringContaining('Approaching time limit')
+      expect.stringContaining('Scheduling continuation')
     );
 
-    // Restore Date
-    global.Date = originalDate;
+    restore();
+  });
+
+  test('saves domain index and total to state on time limit', () => {
+    var store = useStatefulProperties({ BLOCK_DOMAINS: '["spam.com","junk.co"]' });
+    var restore = mockTimeLimitExceeded();
+
+    var threads = [createMockThread('a@spam.com', 1)];
+    setSearchResults('from:@spam.com', [threads, threads, threads]);
+
+    bulkCleanup();
+
+    // Should have saved progress
+    expect(store['STATE_BULK_CLEANUP_DOMAIN_INDEX']).toBeDefined();
+    expect(store['STATE_BULK_CLEANUP_TOTAL']).toBeDefined();
+
+    restore();
+  });
+
+  test('resumes from saved domain index on continuation', () => {
+    // Simulate: domain 0 already done, resume from domain 1
+    useStatefulProperties({
+      BLOCK_DOMAINS: '["spam.com","junk.co"]',
+      STATE_BULK_CLEANUP_DOMAIN_INDEX: '1',
+      STATE_BULK_CLEANUP_TOTAL: '5'
+    });
+
+    var junkThread = createMockThread('b@junk.co', 1);
+    setSearchResults('from:@junk.co', [[junkThread], []]);
+
+    bulkCleanup();
+
+    // Should NOT have searched for spam.com (already done)
+    var spamSearches = mockGmailApp.search.mock.calls.filter(
+      (call) => call[0].indexOf('spam.com') !== -1
+    );
+    expect(spamSearches).toHaveLength(0);
+
+    // Should have processed junk.co
+    expect(junkThread.moveToTrash).toHaveBeenCalled();
+
+    expect(mockLogger.log).toHaveBeenCalledWith(
+      expect.stringContaining('Resuming bulkCleanup')
+    );
+  });
+
+  test('clears state when all domains are processed', () => {
+    var store = useStatefulProperties({
+      BLOCK_DOMAINS: '["spam.com"]',
+      STATE_BULK_CLEANUP_DOMAIN_INDEX: '0',
+      STATE_BULK_CLEANUP_TOTAL: '3'
+    });
+
+    setSearchResults('from:@spam.com', [[]]);
+
+    bulkCleanup();
+
+    expect(store['STATE_BULK_CLEANUP_DOMAIN_INDEX']).toBeUndefined();
+    expect(store['STATE_BULK_CLEANUP_TOTAL']).toBeUndefined();
   });
 });
 
@@ -419,10 +485,7 @@ describe('bulkCleanup', () => {
 
 describe('purgeOldPromotions', () => {
   test('uses configured PROMO_MAX_AGE_DAYS in query', () => {
-    mockScriptProperties.getProperty.mockImplementation((key) => {
-      if (key === 'PROMO_MAX_AGE_DAYS') return '14';
-      return null;
-    });
+    useStatefulProperties({ PROMO_MAX_AGE_DAYS: '14' });
     setSearchResults('category:promotions', [[]]);
 
     purgeOldPromotions();
@@ -432,7 +495,7 @@ describe('purgeOldPromotions', () => {
   });
 
   test('falls back to 7 days when config is missing', () => {
-    mockScriptProperties.getProperty.mockReturnValue(null);
+    useStatefulProperties();
     setSearchResults('category:promotions', [[]]);
 
     purgeOldPromotions();
@@ -442,7 +505,7 @@ describe('purgeOldPromotions', () => {
   });
 
   test('trashes all matching threads', () => {
-    mockScriptProperties.getProperty.mockReturnValue(null);
+    useStatefulProperties();
 
     var thread1 = createMockThread('promo@store.com', 1);
     var thread2 = createMockThread('deals@shop.com', 1);
@@ -454,48 +517,205 @@ describe('purgeOldPromotions', () => {
     expect(thread2.moveToTrash).toHaveBeenCalled();
   });
 
-  test('handles time limit gracefully', () => {
-    mockScriptProperties.getProperty.mockReturnValue(null);
-
-    var callCount = 0;
-    var startTime = 1000000;
-    var originalDate = global.Date;
-    global.Date = class extends originalDate {
-      getTime() {
-        callCount++;
-        if (callCount > 2) return startTime + 6 * 60 * 1000;
-        return startTime;
-      }
-      toISOString() {
-        return new originalDate().toISOString();
-      }
-    };
+  test('schedules continuation trigger on time limit', () => {
+    useStatefulProperties();
+    var restore = mockTimeLimitExceeded();
 
     var threads = [createMockThread('a@store.com', 1)];
     setSearchResults('category:promotions', [threads, threads, threads]);
 
     purgeOldPromotions();
 
+    expect(mockScriptApp.newTrigger).toHaveBeenCalledWith('purgeOldPromotions');
     expect(mockLogger.log).toHaveBeenCalledWith(
-      expect.stringContaining('Approaching time limit')
+      expect.stringContaining('Scheduling continuation')
     );
 
-    global.Date = originalDate;
+    restore();
+  });
+
+  test('resumes with previous total on continuation', () => {
+    useStatefulProperties({ STATE_PURGE_PROMO_TOTAL: '50' });
+
+    setSearchResults('category:promotions', [[]]);
+
+    purgeOldPromotions();
+
+    expect(mockLogger.log).toHaveBeenCalledWith(
+      expect.stringContaining('Resuming purgeOldPromotions')
+    );
+  });
+
+  test('clears state when complete', () => {
+    var store = useStatefulProperties({ STATE_PURGE_PROMO_TOTAL: '50' });
+
+    setSearchResults('category:promotions', [[]]);
+
+    purgeOldPromotions();
+
+    expect(store['STATE_PURGE_PROMO_TOTAL']).toBeUndefined();
   });
 });
 
 // ============================================================
-// F. Trigger management
+// F. Mark all as read
+// ============================================================
+
+describe('markAllRead', () => {
+  test('marks all unread threads as read', () => {
+    useStatefulProperties();
+
+    var thread1 = createMockThread('a@test.com', 1);
+    var thread2 = createMockThread('b@test.com', 1);
+    setSearchResults('is:unread', [[thread1, thread2], []]);
+
+    markAllRead();
+
+    expect(thread1.markRead).toHaveBeenCalled();
+    expect(thread2.markRead).toHaveBeenCalled();
+  });
+
+  test('searches with is:unread query', () => {
+    useStatefulProperties();
+    setSearchResults('is:unread', [[]]);
+
+    markAllRead();
+
+    var searchQuery = mockGmailApp.search.mock.calls[0][0];
+    expect(searchQuery).toBe('is:unread');
+  });
+
+  test('paginates through multiple batches', () => {
+    useStatefulProperties();
+
+    var batch1 = [
+      createMockThread('a@test.com', 1),
+      createMockThread('b@test.com', 1),
+    ];
+    var batch2 = [
+      createMockThread('c@test.com', 1),
+    ];
+    setSearchResults('is:unread', [batch1, batch2, []]);
+
+    markAllRead();
+
+    batch1.forEach((t) => expect(t.markRead).toHaveBeenCalled());
+    batch2.forEach((t) => expect(t.markRead).toHaveBeenCalled());
+  });
+
+  test('does not call moveToTrash (read-only operation)', () => {
+    useStatefulProperties();
+
+    var thread = createMockThread('a@test.com', 1);
+    setSearchResults('is:unread', [[thread], []]);
+
+    markAllRead();
+
+    expect(thread.markRead).toHaveBeenCalled();
+    expect(thread.moveToTrash).not.toHaveBeenCalled();
+  });
+
+  test('handles empty inbox (no unread emails)', () => {
+    useStatefulProperties();
+    setSearchResults('is:unread', [[]]);
+
+    markAllRead();
+
+    expect(mockLogger.log).toHaveBeenCalledWith(
+      expect.stringContaining('0 threads marked as read')
+    );
+  });
+
+  test('pauses every 1000 threads to avoid rate limits', () => {
+    useStatefulProperties();
+
+    var batches = [];
+    for (var b = 0; b < 10; b++) {
+      var batch = [];
+      for (var t = 0; t < 100; t++) {
+        batch.push(createMockThread('user' + (b * 100 + t) + '@test.com', 1));
+      }
+      batches.push(batch);
+    }
+    batches.push([]);
+    setSearchResults('is:unread', batches);
+
+    markAllRead();
+
+    expect(mockUtilities.sleep).toHaveBeenCalledWith(2000);
+    expect(mockUtilities.sleep).toHaveBeenCalledTimes(1);
+  });
+
+  test('does not pause before reaching 1000 threads', () => {
+    useStatefulProperties();
+
+    var batch = [];
+    for (var t = 0; t < 50; t++) {
+      batch.push(createMockThread('user' + t + '@test.com', 1));
+    }
+    setSearchResults('is:unread', [[...batch], []]);
+
+    markAllRead();
+
+    expect(mockUtilities.sleep).not.toHaveBeenCalled();
+  });
+
+  test('schedules continuation trigger on time limit', () => {
+    useStatefulProperties();
+    var restore = mockTimeLimitExceeded();
+
+    var threads = [createMockThread('a@test.com', 1)];
+    setSearchResults('is:unread', [threads, threads, threads]);
+
+    markAllRead();
+
+    expect(mockScriptApp.newTrigger).toHaveBeenCalledWith('markAllRead');
+    expect(mockLogger.log).toHaveBeenCalledWith(
+      expect.stringContaining('Scheduling continuation')
+    );
+
+    restore();
+  });
+
+  test('resumes with previous total on continuation', () => {
+    useStatefulProperties({ STATE_MARK_READ_TOTAL: '500' });
+
+    setSearchResults('is:unread', [[]]);
+
+    markAllRead();
+
+    expect(mockLogger.log).toHaveBeenCalledWith(
+      expect.stringContaining('Resuming markAllRead')
+    );
+  });
+
+  test('clears state when complete', () => {
+    var store = useStatefulProperties({ STATE_MARK_READ_TOTAL: '500' });
+
+    setSearchResults('is:unread', [[]]);
+
+    markAllRead();
+
+    expect(store['STATE_MARK_READ_TOTAL']).toBeUndefined();
+  });
+});
+
+// ============================================================
+// G. Trigger management
 // ============================================================
 
 describe('installTrigger', () => {
-  test('removes existing triggers before creating new one', () => {
-    // Pre-add a trigger
-    mockScriptApp.getProjectTriggers.mockReturnValue([{ id: 'old_trigger' }]);
+  test('removes existing dailyAutoClean triggers before creating new one', () => {
+    var oldTrigger = { id: 'old', getHandlerFunction: () => 'dailyAutoClean' };
+    var contTrigger = { id: 'cont', getHandlerFunction: () => 'bulkCleanup' };
+    mockScriptApp.getProjectTriggers.mockReturnValue([oldTrigger, contTrigger]);
 
     installTrigger();
 
-    expect(mockScriptApp.deleteTrigger).toHaveBeenCalledWith({ id: 'old_trigger' });
+    // Should delete the old daily trigger
+    expect(mockScriptApp.deleteTrigger).toHaveBeenCalledWith(oldTrigger);
+    // Should NOT delete continuation triggers
+    expect(mockScriptApp.deleteTrigger).not.toHaveBeenCalledWith(contTrigger);
     expect(mockScriptApp.newTrigger).toHaveBeenCalledWith('dailyAutoClean');
   });
 
@@ -516,6 +736,10 @@ describe('removeTriggers', () => {
     var trigger1 = { id: 't1' };
     var trigger2 = { id: 't2' };
     mockScriptApp.getProjectTriggers.mockReturnValue([trigger1, trigger2]);
+    useStatefulProperties({
+      STATE_BULK_CLEANUP_DOMAIN_INDEX: '2',
+      STATE_MARK_READ_TOTAL: '100'
+    });
 
     removeTriggers();
 
@@ -523,8 +747,26 @@ describe('removeTriggers', () => {
     expect(mockScriptApp.deleteTrigger).toHaveBeenCalledWith(trigger2);
   });
 
+  test('clears continuation state', () => {
+    mockScriptApp.getProjectTriggers.mockReturnValue([]);
+    var store = useStatefulProperties({
+      STATE_BULK_CLEANUP_DOMAIN_INDEX: '2',
+      STATE_BULK_CLEANUP_TOTAL: '50',
+      STATE_MARK_READ_TOTAL: '100',
+      STATE_PURGE_PROMO_TOTAL: '30'
+    });
+
+    removeTriggers();
+
+    expect(store['STATE_BULK_CLEANUP_DOMAIN_INDEX']).toBeUndefined();
+    expect(store['STATE_BULK_CLEANUP_TOTAL']).toBeUndefined();
+    expect(store['STATE_MARK_READ_TOTAL']).toBeUndefined();
+    expect(store['STATE_PURGE_PROMO_TOTAL']).toBeUndefined();
+  });
+
   test('does not error with zero existing triggers', () => {
     mockScriptApp.getProjectTriggers.mockReturnValue([]);
+    useStatefulProperties();
 
     expect(() => removeTriggers()).not.toThrow();
     expect(mockLogger.log).toHaveBeenCalledWith('Removed 0 trigger(s).');
@@ -532,18 +774,35 @@ describe('removeTriggers', () => {
 });
 
 // ============================================================
-// G. Integration: dailyAutoClean
+// H. Continuation helpers
+// ============================================================
+
+describe('scheduleContinuation_', () => {
+  test('removes existing triggers for the same function before creating new one', () => {
+    var existingTrigger = { id: 'old', getHandlerFunction: () => 'bulkCleanup' };
+    var otherTrigger = { id: 'other', getHandlerFunction: () => 'dailyAutoClean' };
+    mockScriptApp.getProjectTriggers.mockReturnValue([existingTrigger, otherTrigger]);
+
+    scheduleContinuation_('bulkCleanup');
+
+    expect(mockScriptApp.deleteTrigger).toHaveBeenCalledWith(existingTrigger);
+    expect(mockScriptApp.deleteTrigger).not.toHaveBeenCalledWith(otherTrigger);
+    expect(mockScriptApp.newTrigger).toHaveBeenCalledWith('bulkCleanup');
+  });
+});
+
+// ============================================================
+// I. Integration: dailyAutoClean
 // ============================================================
 
 describe('dailyAutoClean', () => {
-  test('calls both purgeOldPromotions and bulkCleanup', () => {
-    mockScriptProperties.getProperty.mockReturnValue(null);
+  test('calls purgeOldPromotions, bulkCleanup, and markAllRead', () => {
+    useStatefulProperties();
     setSearchResults('category:promotions', [[]]);
+    setSearchResults('is:unread', [[]]);
 
     dailyAutoClean();
 
-    // Verify both functions ran by checking that GmailApp.search was called
-    // with both promo and domain queries (at minimum the promo query)
     expect(mockGmailApp.search).toHaveBeenCalled();
     expect(mockLogger.log).toHaveBeenCalledWith(
       expect.stringContaining('Daily auto-clean started')
@@ -555,133 +814,12 @@ describe('dailyAutoClean', () => {
 });
 
 // ============================================================
-// H. Mark all as read
-// ============================================================
-
-describe('markAllRead', () => {
-  test('marks all unread threads as read', () => {
-    var thread1 = createMockThread('a@test.com', 1);
-    var thread2 = createMockThread('b@test.com', 1);
-    setSearchResults('is:unread', [[thread1, thread2], []]);
-
-    markAllRead();
-
-    expect(thread1.markRead).toHaveBeenCalled();
-    expect(thread2.markRead).toHaveBeenCalled();
-  });
-
-  test('searches with is:unread query', () => {
-    setSearchResults('is:unread', [[]]);
-
-    markAllRead();
-
-    var searchQuery = mockGmailApp.search.mock.calls[0][0];
-    expect(searchQuery).toBe('is:unread');
-  });
-
-  test('paginates through multiple batches', () => {
-    var batch1 = [
-      createMockThread('a@test.com', 1),
-      createMockThread('b@test.com', 1),
-    ];
-    var batch2 = [
-      createMockThread('c@test.com', 1),
-    ];
-    setSearchResults('is:unread', [batch1, batch2, []]);
-
-    markAllRead();
-
-    batch1.forEach((t) => expect(t.markRead).toHaveBeenCalled());
-    batch2.forEach((t) => expect(t.markRead).toHaveBeenCalled());
-  });
-
-  test('does not call moveToTrash (read-only operation)', () => {
-    var thread = createMockThread('a@test.com', 1);
-    setSearchResults('is:unread', [[thread], []]);
-
-    markAllRead();
-
-    expect(thread.markRead).toHaveBeenCalled();
-    expect(thread.moveToTrash).not.toHaveBeenCalled();
-  });
-
-  test('handles empty inbox (no unread emails)', () => {
-    setSearchResults('is:unread', [[]]);
-
-    markAllRead();
-
-    expect(mockLogger.log).toHaveBeenCalledWith('Marked 0 threads as read.');
-  });
-
-  test('pauses every 1000 threads to avoid rate limits', () => {
-    // Create 10 batches of 100 threads = 1000 total, then empty
-    var batches = [];
-    for (var b = 0; b < 10; b++) {
-      var batch = [];
-      for (var t = 0; t < 100; t++) {
-        batch.push(createMockThread('user' + (b * 100 + t) + '@test.com', 1));
-      }
-      batches.push(batch);
-    }
-    batches.push([]); // terminator
-    setSearchResults('is:unread', batches);
-
-    markAllRead();
-
-    // Should have paused once at 1000 threads
-    expect(mockUtilities.sleep).toHaveBeenCalledWith(2000);
-    expect(mockUtilities.sleep).toHaveBeenCalledTimes(1);
-  });
-
-  test('does not pause before reaching 1000 threads', () => {
-    var batch = [];
-    for (var t = 0; t < 50; t++) {
-      batch.push(createMockThread('user' + t + '@test.com', 1));
-    }
-    setSearchResults('is:unread', [[...batch], []]);
-
-    markAllRead();
-
-    expect(mockUtilities.sleep).not.toHaveBeenCalled();
-  });
-
-  test('handles time limit gracefully', () => {
-    var callCount = 0;
-    var startTime = 1000000;
-    var originalDate = global.Date;
-    global.Date = class extends originalDate {
-      getTime() {
-        callCount++;
-        if (callCount > 2) return startTime + 6 * 60 * 1000;
-        return startTime;
-      }
-      toISOString() {
-        return new originalDate().toISOString();
-      }
-    };
-
-    var threads = [createMockThread('a@test.com', 1)];
-    setSearchResults('is:unread', [threads, threads, threads]);
-
-    markAllRead();
-
-    expect(mockLogger.log).toHaveBeenCalledWith(
-      expect.stringContaining('Approaching time limit')
-    );
-
-    global.Date = originalDate;
-  });
-});
-
-// ============================================================
-// I. addBlocks (template function)
+// J. addBlocks (template function)
 // ============================================================
 
 describe('addBlocks', () => {
   test('calls updateBlockedDomains (template has empty array by default)', () => {
-    mockScriptProperties.getProperty.mockReturnValue('[]');
-
-    // Should not throw even with empty array
+    useStatefulProperties({ BLOCK_DOMAINS: '[]' });
     expect(() => addBlocks()).not.toThrow();
   });
 });

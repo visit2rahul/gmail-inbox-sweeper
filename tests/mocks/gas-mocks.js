@@ -118,6 +118,7 @@ const mockTriggerBuilder = {
   timeBased: jest.fn(function () { return this; }),
   everyDays: jest.fn(function () { return this; }),
   atHour: jest.fn(function () { return this; }),
+  after: jest.fn(function () { return this; }),
   create: jest.fn(function () {
     var trigger = { id: 'trigger_' + Date.now() };
     projectTriggers.push(trigger);
@@ -159,6 +160,7 @@ function resetAllMocks() {
   mockScriptApp.deleteTrigger.mockClear();
   mockUtilities.sleep.mockClear();
   mockTriggerBuilder.timeBased.mockClear();
+  mockTriggerBuilder.after.mockClear();
   mockTriggerBuilder.everyDays.mockClear();
   mockTriggerBuilder.atHour.mockClear();
   mockTriggerBuilder.create.mockClear();
